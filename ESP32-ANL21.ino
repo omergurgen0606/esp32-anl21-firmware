@@ -1,9 +1,17 @@
 #include <ModbusMaster.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include <HTTPUpdate.h>
 #include <esp_mac.h>
+#include <esp_ota_ops.h>
+
+// Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
+// karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
+// calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
+#define FW_VERSION "1.0.1"
 
 #define RE_DE_PIN 4
 #define RXD2 16
@@ -98,8 +106,18 @@ HarmonicsBlock harmCurrent, harmVoltage;
 // tum cihazlara (marka farketmeksizin) degistirilmeden yuklenebilir, fabrikada
 // cihaza ozel ayar gerekmez. Topic'ler bu ID'ye gore olusturulur.
 String deviceId;
-String liveTopic, energyTopic, statusTopic, cmdTopic;
+String liveTopic, energyTopic, statusTopic, cmdTopic, otaTopic;
 String statsTopic, peaksTopic, demandTopic, harmonicsTopic, infoTopic;
+
+// OTA guvenlik agi: yeni firmware yazildiktan hemen sonra "pending" olarak
+// isaretlenir. Bu firmware WiFi+MQTT'ye baglanip en az bir kez canli veri
+// okuyabilirse "onaylanmis" sayilir (esp_ota_mark_app_valid_cancel_rollback).
+// Belirlenen surede onaylanamazsa onceki (calisir durumdaki) firmware'e
+// otomatik geri donulur -- kotu bir OTA cihazi sahada "tugla"ya cevirmesin diye.
+Preferences otaPrefs;
+bool otaPendingConfirm = false;
+unsigned long otaPendingSince = 0;
+#define OTA_CONFIRM_TIMEOUT_MS (90UL * 1000UL)
 
 // WiFi kurulumu: telefon uygulamasi (Tuya benzeri) cihazin actigi AP'ye baglanip
 // buradan ev WiFi bilgisini gonderir -- tarayici/portal sayfasi yok, tamamen JSON.
@@ -121,6 +139,7 @@ void setupDeviceId() {
   energyTopic = "powermeter/" + deviceId + "/energy";
   statusTopic = "powermeter/" + deviceId + "/status";
   cmdTopic    = "powermeter/" + deviceId + "/cmd";
+  otaTopic    = "powermeter/" + deviceId + "/ota";
   statsTopic     = "powermeter/" + deviceId + "/stats";
   peaksTopic     = "powermeter/" + deviceId + "/peaks";
   demandTopic    = "powermeter/" + deviceId + "/demand";
@@ -474,7 +493,109 @@ bool readDeviceInfo() {
 // bir komutu ilgili registera yazar (fonksiyon kodu 06, single register write).
 // "value" verilmezse varsayilan 1'dir. Excel'deki "Komutlar" sayfasi 0xAA55
 // (43605) tetik degerini dokumante ediyor -- ANL13'te bu bilinmiyordu.
+// Basit JSON string alan cikarici -- {"url":"...","version":"..."} gibi duz
+// bir govdeden bir alani cikarir. WiFi provisioning'deki extractJsonString ile
+// ayni yaklasim, burada da ArduinoJson bagimliligi eklemekten kaciniliyor.
+bool extractJsonField(const char* body, const char* key, char* out, size_t outSize) {
+  char pattern[32];
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  const char* p = strstr(body, pattern);
+  if (!p) return false;
+  p = strchr(p, ':');
+  if (!p) return false;
+  p = strchr(p, '"');
+  if (!p) return false;
+  p++;
+  const char* end = strchr(p, '"');
+  if (!end) return false;
+  size_t len = end - p;
+  if (len >= outSize) len = outSize - 1;
+  memcpy(out, p, len);
+  out[len] = '\0';
+  return true;
+}
+
+void handleOtaMessage(byte* payload, unsigned int length) {
+  char buf[400];
+  unsigned int n = length < sizeof(buf) - 1 ? length : sizeof(buf) - 1;
+  memcpy(buf, payload, n);
+  buf[n] = '\0';
+
+  char url[300];
+  char version[32];
+  if (!extractJsonField(buf, "url", url, sizeof(url))) {
+    Serial.println("OTA: gecersiz mesaj, url alani yok");
+    return;
+  }
+  extractJsonField(buf, "version", version, sizeof(version));
+
+  Serial.print("OTA baslatiliyor, surum: ");
+  Serial.print(version);
+  Serial.print(" url: ");
+  Serial.println(url);
+
+  // Yazma basladiktan sonra bir kesinti/cokme olursa bir dahaki acilista bunu
+  // hatirlayip geri donus zaman asimini calistirabilmek icin flash'a yaziliyor.
+  otaPrefs.putBool("pending", true);
+
+  WiFiClientSecure client;
+  client.setInsecure(); // Kendi sunucumuz, sertifika sabitleme suanlik yapilmiyor
+  httpUpdate.rebootOnUpdate(false);
+  t_httpUpdate_return ret = httpUpdate.update(client, url);
+
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("OTA basarisiz (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+      otaPrefs.putBool("pending", false); // yazma hic basarili olmadi, eski firmware zaten aktif
+      mqttClient.publish(statusTopic.c_str(), "ota_failed", false);
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("OTA: guncelleme yok");
+      otaPrefs.putBool("pending", false);
+      break;
+    case HTTP_UPDATE_OK:
+      Serial.println("OTA basarili, yeniden baslatiliyor...");
+      mqttClient.publish(statusTopic.c_str(), "ota_rebooting", false);
+      delay(200);
+      ESP.restart();
+      break;
+  }
+}
+
+// Yeni yazilan firmware WiFi+MQTT'ye baglanip en az bir kez canli veri
+// okuyabildiginde cagrilir -- bu surumu "gecerli" isaretler, bir sonraki
+// acilista rollback tetiklenmez.
+void confirmOtaIfPending() {
+  if (!otaPendingConfirm) return;
+  esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+  if (err == ESP_OK) {
+    Serial.println("OTA onaylandi, bu surum kalici.");
+  } else {
+    Serial.printf("OTA onayi basarisiz (esp_err=%d) -- rollback bu cihazda desteklenmiyor olabilir.\n", err);
+  }
+  otaPrefs.putBool("pending", false);
+  otaPendingConfirm = false;
+}
+
+// Acilista "pending" isaretliyse (bir onceki OTA hic onaylanmamis) belli bir
+// sure icinde onaylanmazsa onceki firmware'e geri donulur.
+void checkOtaRollbackTimeout() {
+  if (!otaPendingConfirm) return;
+  if (millis() - otaPendingSince < OTA_CONFIRM_TIMEOUT_MS) return;
+  Serial.println("OTA onaylanamadi, onceki firmware'e donuluyor...");
+  esp_ota_mark_app_invalid_rollback_and_reboot();
+  // Rollback desteklenmiyorsa yukarasi geri doner -- sonsuz dongude tekrar
+  // denemeyelim diye pending'i temizleyip normal calismaya devam ediyoruz.
+  otaPrefs.putBool("pending", false);
+  otaPendingConfirm = false;
+}
+
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  if (otaTopic.length() && strcmp(topic, otaTopic.c_str()) == 0) {
+    handleOtaMessage(payload, length);
+    return;
+  }
+
   char buf[64];
   unsigned int n = length < sizeof(buf) - 1 ? length : sizeof(buf) - 1;
   memcpy(buf, payload, n);
@@ -659,6 +780,16 @@ void setup() {
   Serial.print("CIHAZ ID (etikete/kutuya yazin): ");
   Serial.println(deviceId);
 
+  Serial.print("Firmware surumu: ");
+  Serial.println(FW_VERSION);
+
+  otaPrefs.begin("ota", false);
+  if (otaPrefs.getBool("pending", false)) {
+    Serial.println("Bu, onaylanmamis bir OTA sonrasi ilk acilis -- onaylanamazsa geri donulecek.");
+    otaPendingConfirm = true;
+    otaPendingSince = millis();
+  }
+
   pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
   prefs.begin("wifi", false);
 
@@ -727,10 +858,13 @@ void loop() {
       statusTopic.c_str(), 1, true, "offline");
     if (ok) {
       mqttClient.subscribe(cmdTopic.c_str());
+      mqttClient.subscribe(otaTopic.c_str());
       mqttClient.publish(statusTopic.c_str(), "online", true);
     }
   }
   mqttClient.loop();
+
+  checkOtaRollbackTimeout();
 
   // Cihaz bilgisi statik oldugu icin bir kez (retained) yayinlanir.
   if (deviceInfoOk && !deviceInfoPublished && mqttClient.connected()) {
@@ -749,6 +883,7 @@ void loop() {
   }
 
   bool okLive = readPowerAnalyzer();
+  if (okLive) confirmOtaIfPending();
 
   if (okLive) {
     char payload[800];
@@ -776,14 +911,14 @@ void loop() {
     readCtRatio(); // basarisiz olursa ctRatio son bilinen degerinde kalir
 
     if (energyOk) {
-      char energyPayload[320];
+      char energyPayload[350];
       snprintf(energyPayload, sizeof(energyPayload),
         "{\"active_wh_tuketim\":%lu,\"inductive_varh_tuketim\":%lu,\"capacitive_varh_tuketim\":%lu,"
         "\"active_wh_uretim\":%lu,\"inductive_varh_uretim\":%lu,\"capacitive_varh_uretim\":%lu,"
-        "\"ct_ratio\":%u}",
+        "\"ct_ratio\":%u,\"fw_version\":\"%s\"}",
         energy.activeWhTuketim, energy.inductiveVArhTuketim, energy.capacitiveVArhTuketim,
         energy.activeWhUretim, energy.inductiveVArhUretim, energy.capacitiveVArhUretim,
-        ctRatio);
+        ctRatio, FW_VERSION);
       mqttClient.publish(energyTopic.c_str(), energyPayload);
       Serial.println(energyPayload);
     } else {
