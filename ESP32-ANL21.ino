@@ -22,6 +22,15 @@
 // cihaz kendini yeniden baslatir -- bazi durumlarda WiFi yiginini sadece tam reboot kurtarir.
 #define WIFI_RECONNECT_RESTART_MS (3UL * 60UL * 1000UL)
 
+// Kurulum (AP) modundayken kayitli ag da denenmeye devam eder. Bu olmadan
+// cihaz, modem yeniden baslatildiginda kurulum moduna dusup ORADA KALIYORDU:
+// acilistaki 15 saniyelik pencere bir modemin acilma suresine yetmiyor, ve eski
+// kod AP moduna girdikten sonra kayitli agi bir daha hic denemiyordu. Sahadaki
+// bir cihaz icin bu, WiFi 30 saniye sonra geri gelse bile elinde telefonla
+// yerinde mudahale demekti.
+#define PROVISION_RETRY_INTERVAL_MS (45UL * 1000UL)
+#define PROVISION_RETRY_WINDOW_MS   (15UL * 1000UL)
+
 const char* mqtt_server = "138.68.83.111";
 
 // Bu cihazin 32-bit (Signed 32, 2 register) degerlerinde hangi kelimenin once geldigi
@@ -745,24 +754,68 @@ bool connectToWifi(const String &ssid, const String &pass, unsigned long timeout
 
 // Cihazin kendi Access Point'ini acar ("BinaryEnerji-<cihaz id>", sifresiz) ve
 // telefon uygulamasindan gelecek POST /configure ile ev WiFi bilgisini bekler.
-void startProvisioningAP() {
-  WiFi.mode(WIFI_AP);
+// Donus degeri:
+//   true  -> kayitli aga kendiliginden yeniden baglanildi (kullanici mudahalesi yok)
+//   false -> kullanici telefondan yeni bilgi girdi; pendingSsid/pendingPass dolu
+bool startProvisioningAP(const String &savedSsid, const String &savedPass) {
+  // AP_STA: AP yayinda kalirken ayni anda STA ile kayitli agi da deneyebilelim.
+  // Yalnizca WIFI_AP olsaydi telefon baglanabilirdi ama cihaz kendi agini hic
+  // deneyemezdi -- kurtarmanin tamami buna bagli.
+  WiFi.mode(WIFI_AP_STA);
   String apName = "BinaryEnerji-" + deviceId;
   WiFi.softAP(apName.c_str());
   Serial.print("Kurulum AP'si acildi: ");
   Serial.println(apName);
   Serial.println("Telefon uygulamasindan bu aga baglanip WiFi bilgilerini girin.");
+  if (savedSsid.length() > 0) {
+    Serial.print("Bu sirada kayitli ag da denenmeye devam edecek: ");
+    Serial.println(savedSsid);
+  }
 
-  provisionServer.on("/status", HTTP_GET, handleProvisionStatus);
-  provisionServer.on("/configure", HTTP_POST, handleProvisionConfigure);
+  // Handler'lar yalnizca bir kez kaydedilmeli; bu fonksiyon kurulum basarisiz
+  // olunca tekrar cagriliyor ve WebServer::on her cagrida listeye ekliyor.
+  static bool handlerlarKuruldu = false;
+  if (!handlerlarKuruldu) {
+    provisionServer.on("/status", HTTP_GET, handleProvisionStatus);
+    provisionServer.on("/configure", HTTP_POST, handleProvisionConfigure);
+    handlerlarKuruldu = true;
+  }
   provisionServer.begin();
 
   wifiConfigured = false;
+  unsigned long sonDeneme = millis();
+  unsigned long denemeBasi = 0;
+  bool denemeSuruyor = false;
+
   while (!wifiConfigured) {
+    // Telefon her an baglanabilmeli -- yeniden deneme bunu bloke etmemeli.
     provisionServer.handleClient();
     delay(2);
+
+    if (savedSsid.length() == 0) continue;
+
+    if (!denemeSuruyor && millis() - sonDeneme >= PROVISION_RETRY_INTERVAL_MS) {
+      Serial.println("Kayitli ag yeniden deneniyor...");
+      WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+      denemeSuruyor = true;
+      denemeBasi = millis();
+    }
+
+    if (denemeSuruyor) {
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Kayitli aga yeniden baglanildi, kurulum modundan cikiliyor.");
+        provisionServer.stop();
+        return true;
+      }
+      if (millis() - denemeBasi >= PROVISION_RETRY_WINDOW_MS) {
+        WiFi.disconnect();   // AP_STA'da yalnizca STA tarafini birakir
+        denemeSuruyor = false;
+        sonDeneme = millis();
+      }
+    }
   }
   provisionServer.stop();
+  return false;
 }
 
 void setup() {
@@ -809,17 +862,25 @@ void setup() {
   }
 
   while (!connected) {
-    startProvisioningAP();
+    // Kurulum modu artik bir cikmaz sokak degil: kayitli ag geri gelirse
+    // cihaz kendi kendine kurtulur.
+    if (startProvisioningAP(savedSsid, savedPass)) {
+      connected = true;
+      break;
+    }
     connected = connectToWifi(pendingSsid, pendingPass, 20000);
     if (connected) {
       prefs.putString("ssid", pendingSsid);
       prefs.putString("pass", pendingPass);
+      savedSsid = pendingSsid;
+      savedPass = pendingPass;
     } else {
       Serial.println("Girilen WiFi bilgileriyle baglanilamadi, kurulum moduna donuluyor.");
     }
   }
 
   WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);   // AP_STA'dan tamamen cik
   Serial.print("WiFi'ya baglanildi: ");
   Serial.println(WiFi.SSID());
 
