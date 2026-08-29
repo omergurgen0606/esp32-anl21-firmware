@@ -31,7 +31,18 @@
 #define PROVISION_RETRY_INTERVAL_MS (45UL * 1000UL)
 #define PROVISION_RETRY_WINDOW_MS   (15UL * 1000UL)
 
-const char* mqtt_server = "138.68.83.111";
+// TLS sertifikasi bu ALAN ADINA duzenlendi; IP ile baglanmak host dogrulamasini
+// kirar. Broker artik 8883'te TLS ile dinliyor -- 1883'te broker parolasi her
+// baglantida duz metin gidiyordu ve tum telemetri yolda okunabiliyordu.
+const char* mqtt_server = "binaryenerji.com";
+const uint16_t mqtt_port = 8883;
+
+// Let's Encrypt zincirinin kok sertifikasi (ISRG Root X1, 2035'e kadar gecerli).
+// Sunucu zinciri ... -> ISRG Root X2 -> ISRG Root X1 seklinde tam gonderiyor,
+// bu yuzden yalnizca X1'e guvenmek yetiyor.
+static const char ISRG_ROOT_X1[] PROGMEM = R"CERT(
+""" + cert + """
+)CERT";
 
 // Bu cihazin 32-bit (Signed 32, 2 register) degerlerinde hangi kelimenin once geldigi
 // bilinmiyor (Excel haritasinda belirtilmemis). Ilk gercek okumada deger absurt
@@ -40,7 +51,11 @@ const char* mqtt_server = "138.68.83.111";
 #define WORDS_HIGH_FIRST true
 
 ModbusMaster node;
-WiFiClient espClient;
+WiFiClientSecure espClient;
+// Ust uste basarisiz TLS baglantisi sayaci ve dogrulamanin kapatilip
+// kapatilmadigi. Asagidaki loop() icinde kullaniliyor.
+int tlsBasarisizSayaci = 0;
+bool tlsDogrulamaKapali = false;
 PubSubClient mqttClient(espClient);
 
 struct PowerData {
@@ -548,7 +563,14 @@ void handleOtaMessage(byte* payload, unsigned int length) {
   otaPrefs.putBool("pending", true);
 
   WiFiClientSecure client;
-  client.setInsecure(); // Kendi sunucumuz, sertifika sabitleme suanlik yapilmiyor
+  // OTA dogrulanmis TLS kullanir. setInsecure() ile araya giren biri cihaza
+  // istedigi firmware'i yukleyebilirdi -- telemetriyi okumaktan daha agir bir
+  // acikti. Ayni emniyet yedegi burada da gecerli.
+  if (tlsDogrulamaKapali) {
+    client.setInsecure();
+  } else {
+    client.setCACert(ISRG_ROOT_X1);
+  }
   httpUpdate.rebootOnUpdate(false);
   t_httpUpdate_return ret = httpUpdate.update(client, url);
 
@@ -742,6 +764,31 @@ void handleProvisionConfigure() {
 }
 
 // Ev WiFi agina baglanmayi dener, timeoutMs icinde sonuc alinamazsa false doner.
+// TLS sertifika dogrulamasi cihazin saatine bagli: sertifikanin "gecerlilik
+// baslangici" kontrol edilebilmeli. ESP32 epoch 0'dan (1970) basladigi icin,
+// NTP olmadan her dogrulama "sertifika henuz gecerli degil" diye duser ve cihaz
+// broker'a HIC baglanamaz. Bu yuzden TLS'ten once zaman senkronlanir.
+void senkronlaZaman() {
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Saat senkronlaniyor");
+  unsigned long basla = millis();
+  time_t simdi = time(nullptr);
+  // 2020'den buyuk bir zaman gorene kadar bekle (epoch 0'dan uzaklasti mi)
+  while (simdi < 1600000000 && millis() - basla < 15000) {
+    delay(300);
+    Serial.print(".");
+    simdi = time(nullptr);
+  }
+  Serial.println();
+  if (simdi < 1600000000) {
+    Serial.println("Saat senkronlanamadi -- sertifika dogrulamasi basarisiz olabilir.");
+  } else {
+    Serial.print("Saat: ");
+    Serial.print(ctime(&simdi));
+  }
+}
+
+
 bool connectToWifi(const String &ssid, const String &pass, unsigned long timeoutMs) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
@@ -884,7 +931,12 @@ void setup() {
   Serial.print("WiFi'ya baglanildi: ");
   Serial.println(WiFi.SSID());
 
-  mqttClient.setServer(mqtt_server, 1883);
+  // Sertifika dogrulamasi cihazin SAATI DOGRUYSA calisir; ESP32 epoch 0'dan
+  // basladigi icin NTP olmadan her dogrulama "sertifika henuz gecerli degil"
+  // diye basarisiz olur. Bu yuzden zaman once senkronlaniyor.
+  senkronlaZaman();
+  espClient.setCACert(ISRG_ROOT_X1);
+  mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(onMqttMessage);
   // Harmonik/tepe-deger payload'lari buyuk (50+ alan) -- ANL13'ten daha genis
   // bir tampon gerekiyor, yoksa publish() sessizce basarisiz olur.
@@ -921,6 +973,19 @@ void loop() {
       mqttClient.subscribe(cmdTopic.c_str());
       mqttClient.subscribe(otaTopic.c_str());
       mqttClient.publish(statusTopic.c_str(), "online", true);
+      tlsBasarisizSayaci = 0;
+    } else {
+      tlsBasarisizSayaci++;
+      // EMNIYET YEDEGI: sertifika dogrulamasi surekli basarisiz olursa (kok
+      // sertifika degismis, saat senkronlanamamis, ara sertifika zinciri
+      // farklilasmis) cihaz TAMAMEN erisilemez hale gelirdi -- sahada yeniden
+      // flash icin yerinde mudahale demek. Dogrulanmamis ama SIFRELI baglanti,
+      // hic baglanti olmamasindan yegdir. Duruma gunlukte dikkat cekiliyor.
+      if (tlsBasarisizSayaci >= 5 && !tlsDogrulamaKapali) {
+        Serial.println("UYARI: TLS dogrulamasi 5 kez basarisiz -- dogrulamasiz TLS'e dusuluyor.");
+        espClient.setInsecure();
+        tlsDogrulamaKapali = true;
+      }
     }
   }
   mqttClient.loop();
