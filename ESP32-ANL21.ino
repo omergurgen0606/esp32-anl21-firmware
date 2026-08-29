@@ -131,6 +131,10 @@ HarmonicsBlock harmCurrent, harmVoltage;
 // cihaza ozel ayar gerekmez. Topic'ler bu ID'ye gore olusturulur.
 String deviceId;
 String liveTopic, energyTopic, statusTopic, cmdTopic, otaTopic;
+String wifiTopic;   // WiFi degistirme sonucunun bildirildigi konu
+// 0 = bekleyen sonuc yok, 1 = yeni aga gecildi, 2 = gecilemedi, eskiye donuldu.
+// Sonuc HEMEN yayinlanamiyor: degisim sirasinda MQTT baglantisi kopuyor.
+int wifiDegisimSonucu = 0;
 String statsTopic, peaksTopic, demandTopic, harmonicsTopic, infoTopic;
 
 // OTA guvenlik agi: yeni firmware yazildiktan hemen sonra "pending" olarak
@@ -168,6 +172,7 @@ void setupDeviceId() {
   peaksTopic     = "powermeter/" + deviceId + "/peaks";
   demandTopic    = "powermeter/" + deviceId + "/demand";
   harmonicsTopic = "powermeter/" + deviceId + "/harmonics";
+  wifiTopic = "powermeter/" + deviceId + "/wifi";
   infoTopic      = "powermeter/" + deviceId + "/info";
 }
 
@@ -621,16 +626,90 @@ void checkOtaRollbackTimeout() {
   otaPendingConfirm = false;
 }
 
+// Kucuk bir JSON string cikarici. ArduinoJson bagimliligi eklememek icin --
+// tek ihtiyacimiz iki alan okumak.
+static bool jsonDegerCek(const char* buf, const char* anahtar, String &cikti) {
+  char desen[24];
+  snprintf(desen, sizeof(desen), "\"%s\"", anahtar);
+  const char* p = strstr(buf, desen);
+  if (!p) return false;
+  p = strchr(p + strlen(desen), ':');
+  if (!p) return false;
+  p = strchr(p, '"');            // degerin acilis tirnagi
+  if (!p) return false;
+  p++;
+  const char* son = p;
+  // Kacisli tirnak (\") degerin sonu degildir -- WiFi parolalarinda olabilir.
+  while (*son && !(*son == '"' && *(son - 1) != '\\')) son++;
+  if (!*son) return false;
+  cikti = "";
+  for (const char* q = p; q < son; q++) cikti += *q;
+  return true;
+}
+
+
+// Cihazi baska bir WiFi agina tasir.
+//
+// EN KRITIK NOKTA: yanlis bilgi girilirse cihaz tamamen kaybolur ve yerinde
+// mudahale gerekir. Bu yuzden eski bilgiler saklanip yeni ag DENENIYOR; olmazsa
+// eskiye donuluyor. Yeni bilgiler ancak baglanti KURULDUKTAN sonra kaydediliyor.
+void handleWifiConfig(const char* buf) {
+  String yeniSsid, yeniPass;
+  if (!jsonDegerCek(buf, "ssid", yeniSsid) || yeniSsid.length() == 0) {
+    Serial.println("WiFi komutu: ssid yok, yoksayildi.");
+    return;
+  }
+  jsonDegerCek(buf, "pass", yeniPass);   // acik ag icin bos olabilir
+
+  String eskiSsid = prefs.getString("ssid", "");
+  String eskiPass = prefs.getString("pass", "");
+
+  Serial.print("WiFi degistirme istegi: ");
+  Serial.println(yeniSsid);
+
+  mqttClient.disconnect();
+  WiFi.disconnect();
+  delay(300);
+
+  if (connectToWifi(yeniSsid, yeniPass, 20000)) {
+    // Yalnizca BASARILI baglantidan sonra kaydet.
+    prefs.putString("ssid", yeniSsid);
+    prefs.putString("pass", yeniPass);
+    Serial.print("Yeni aga gecildi: ");
+    Serial.println(WiFi.SSID());
+    wifiDegisimSonucu = 1;
+  } else {
+    Serial.println("Yeni aga baglanilamadi, eski aga donuluyor.");
+    if (connectToWifi(eskiSsid, eskiPass, 20000)) {
+      Serial.println("Eski aga donuldu, kayitli bilgi degismedi.");
+    } else {
+      // Iki ag da yoksa loop() 3 dakika sonra yeniden baslatir ve acilista
+      // kurulum moduna dusulur -- kayitli bilgi hala ESKISI oldugu icin,
+      // eski ag geri gelirse cihaz kendiliginden toparlanir.
+      Serial.println("Eski aga da donulemedi -- yeniden baslatma bekleniyor.");
+    }
+    wifiDegisimSonucu = 2;
+  }
+}
+
+
 void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (otaTopic.length() && strcmp(topic, otaTopic.c_str()) == 0) {
     handleOtaMessage(payload, length);
     return;
   }
 
-  char buf[64];
+  // 64 bayt yalnizca {"register":N,"value":M} icin yetiyordu; WiFi komutunda
+  // SSID + parola var, daha genis tampon gerekiyor.
+  char buf[256];
   unsigned int n = length < sizeof(buf) - 1 ? length : sizeof(buf) - 1;
   memcpy(buf, payload, n);
   buf[n] = '\0';
+
+  if (strstr(buf, "\"cmd\"") && strstr(buf, "wifi")) {
+    handleWifiConfig(buf);
+    return;
+  }
 
   char* p = strstr(buf, "\"register\"");
   if (!p) return;
@@ -974,6 +1053,16 @@ void loop() {
       mqttClient.subscribe(otaTopic.c_str());
       mqttClient.publish(statusTopic.c_str(), "online", true);
       tlsBasarisizSayaci = 0;
+      // WiFi degisiminin sonucu ancak baglanti geri geldiginde bildirilebilir.
+      if (wifiDegisimSonucu) {
+        mqttClient.publish(
+          wifiTopic.c_str(),
+          wifiDegisimSonucu == 1
+            ? "{\"ok\":true}"
+            : "{\"ok\":false,\"hata\":\"yeni aga baglanilamadi, eski ag korundu\"}",
+          true);
+        wifiDegisimSonucu = 0;
+      }
     } else {
       tlsBasarisizSayaci++;
       // EMNIYET YEDEGI: sertifika dogrulamasi surekli basarisiz olursa (kok
