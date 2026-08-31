@@ -37,11 +37,15 @@
 const char* mqtt_server = "binaryenerji.com";
 const uint16_t mqtt_port = 8883;
 
-// Let's Encrypt zincirinin kok sertifikasi (ISRG Root X1, 2035'e kadar gecerli).
-// Sunucu zinciri ... -> ISRG Root X2 -> ISRG Root X1 seklinde tam gonderiyor,
-// bu yuzden yalnizca X1'e guvenmek yetiyor.
-static const char ISRG_ROOT_X1[] PROGMEM = R"CERT(
-""" + cert + """
+// Let's Encrypt zincirinin kok sertifikalari. IKISI de gomulu:
+// zincir ... -> Root YE -> ISRG Root X2 -> ISRG Root X1 seklinde geliyor ve X2
+// kendinden imzali. Yalnizca X1 gomuluyken dogrulama capraz imzali yola bagli
+// kaliyordu; X2 de eklenince zincir bir kademe once demirlenebiliyor. Ilk saha
+// denemesinde dokuz el sikismasi istemci tarafindan iptal edildi, bu yuzden
+// dogrulama yolu olabildigince kisa ve saglam olsun istiyoruz.
+static const char ISRG_ROOTS[] PROGMEM = R"CERT(
+""" + x1 + """
+""" + x2 + """
 )CERT";
 
 // Bu cihazin 32-bit (Signed 32, 2 register) degerlerinde hangi kelimenin once geldigi
@@ -56,6 +60,12 @@ WiFiClientSecure espClient;
 // kapatilmadigi. Asagidaki loop() icinde kullaniliyor.
 int tlsBasarisizSayaci = 0;
 bool tlsDogrulamaKapali = false;
+// Dogrulamasiz TLS'e dusuldukten sonra ne zaman tekrar denenecegi.
+// Onceki surumde dusus KALICIYDI: saat sonradan senkronlansa bile cihaz
+// oturum boyunca dogrulamasiz kaliyordu. Sahadaki bir cihazi kalici olarak
+// zayif modda birakmak, gecici bir aksakligin kabul edilebilir bedeli degil.
+unsigned long tlsTekrarDenemeMs = 0;
+#define TLS_DOGRULAMA_TEKRAR_MS (10UL * 60UL * 1000UL)
 PubSubClient mqttClient(espClient);
 
 struct PowerData {
@@ -574,7 +584,7 @@ void handleOtaMessage(byte* payload, unsigned int length) {
   if (tlsDogrulamaKapali) {
     client.setInsecure();
   } else {
-    client.setCACert(ISRG_ROOT_X1);
+    client.setCACert(ISRG_ROOTS);
   }
   httpUpdate.rebootOnUpdate(false);
   t_httpUpdate_return ret = httpUpdate.update(client, url);
@@ -847,7 +857,7 @@ void handleProvisionConfigure() {
 // baslangici" kontrol edilebilmeli. ESP32 epoch 0'dan (1970) basladigi icin,
 // NTP olmadan her dogrulama "sertifika henuz gecerli degil" diye duser ve cihaz
 // broker'a HIC baglanamaz. Bu yuzden TLS'ten once zaman senkronlanir.
-void senkronlaZaman() {
+bool senkronlaZaman() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print("Saat senkronlaniyor");
   unsigned long basla = millis();
@@ -860,11 +870,12 @@ void senkronlaZaman() {
   }
   Serial.println();
   if (simdi < 1600000000) {
-    Serial.println("Saat senkronlanamadi -- sertifika dogrulamasi basarisiz olabilir.");
-  } else {
-    Serial.print("Saat: ");
-    Serial.print(ctime(&simdi));
+    Serial.println("Saat senkronlanamadi -- sertifika dogrulamasi basarisiz olacak.");
+    return false;
   }
+  Serial.print("Saat: ");
+  Serial.print(ctime(&simdi));
+  return true;
 }
 
 
@@ -1014,7 +1025,7 @@ void setup() {
   // basladigi icin NTP olmadan her dogrulama "sertifika henuz gecerli degil"
   // diye basarisiz olur. Bu yuzden zaman once senkronlaniyor.
   senkronlaZaman();
-  espClient.setCACert(ISRG_ROOT_X1);
+  espClient.setCACert(ISRG_ROOTS);
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(onMqttMessage);
   // Harmonik/tepe-deger payload'lari buyuk (50+ alan) -- ANL13'ten daha genis
@@ -1072,12 +1083,29 @@ void loop() {
       // hic baglanti olmamasindan yegdir. Duruma gunlukte dikkat cekiliyor.
       if (tlsBasarisizSayaci >= 5 && !tlsDogrulamaKapali) {
         Serial.println("UYARI: TLS dogrulamasi 5 kez basarisiz -- dogrulamasiz TLS'e dusuluyor.");
+        Serial.println("       (Saat senkronlanmadiysa sebep budur; 10 dakikada bir tekrar denenecek.)");
         espClient.setInsecure();
         tlsDogrulamaKapali = true;
+        tlsTekrarDenemeMs = millis();
       }
     }
   }
   mqttClient.loop();
+
+  // Dogrulamasiz moddan CIKMAYI dene. Dusus gecici olmali: saat gec
+  // senkronlandiysa ya da aksaklik gectiyse cihaz kendiliginden dogrulanmis
+  // TLS'e donsun. Aksi halde tek bir kotu an, cihazi bir daha flash'lanana
+  // kadar zayif modda birakirdi.
+  if (tlsDogrulamaKapali && millis() - tlsTekrarDenemeMs > TLS_DOGRULAMA_TEKRAR_MS) {
+    tlsTekrarDenemeMs = millis();
+    if (senkronlaZaman()) {
+      Serial.println("Saat artik gecerli -- dogrulanmis TLS tekrar deneniyor.");
+      espClient.setCACert(ISRG_ROOTS);
+      tlsDogrulamaKapali = false;
+      tlsBasarisizSayaci = 0;
+      mqttClient.disconnect();   // yeni el sikismasi dogrulamali olsun
+    }
+  }
 
   checkOtaRollbackTimeout();
 
