@@ -1128,7 +1128,33 @@ void loop() {
   bool okLive = readPowerAnalyzer();
   if (okLive) confirmOtaIfPending();
 
-  if (okLive) {
+  // Analizor CEVAP veriyor ama hicbir sey OLCMUYOR: uc fazin gerilimi de tam
+  // sifir ve frekans sifir. Sebekede frekans asla sifir olmaz -- bu bir olcum
+  // degil, "gerilim girisleri / akim trafolari bagli degil" halidir.
+  //
+  // Bunlar okuma HATASI olmadigi icin (Modbus basariyla donuyor) eskiden
+  // yayinlaniyordu: panel 0.0 V'u gercek olcum gibi gosteriyor, fatura ve
+  // enerji analizi de bu satirlar uzerinden hesaplaniyordu. Uretimde biriken
+  // 74.194 kaydin 33.198'i (%45) tam olarak boyleydi.
+  bool olcumYok = okLive && data.v1 == 0 && data.v2 == 0 && data.v3 == 0 && data.f1 == 0;
+
+  // Tek bir durum degiskeni: iki ayri static ile gecis dogru izlenmez.
+  static bool oncekiOlcumYok = false;
+  static unsigned long sonUyariMs = 0;
+  if (olcumYok) {
+    // 2 saniyede bir basmak seri cikisi bogar; gecise ve sonra seyrek bildir.
+    if (!oncekiOlcumYok || millis() - sonUyariMs > 60000) {
+      Serial.println("Analizor cevap veriyor ama olcum yok (V=0, f=0) -- yayinlanmiyor.");
+      Serial.println("  Gerilim girisleri ve akim trafolarinin bagli oldugunu kontrol edin.");
+      sonUyariMs = millis();
+    }
+  } else if (okLive && oncekiOlcumYok) {
+    Serial.println("Olcum geri geldi.");
+  }
+  // Yalnizca gecerli bir okuma varken guncelle: Modbus hatasi durumu bozmasin.
+  if (okLive) oncekiOlcumYok = olcumYok;
+
+  if (okLive && !olcumYok) {
     char payload[800];
     snprintf(payload, sizeof(payload),
       "{\"v1\":%.1f,\"i1\":%.3f,\"p1\":%.0f,\"q1\":%.0f,\"s1\":%.0f,\"f1\":%.2f,\"cos1\":%.3f,\"pf1\":%.3f,\"thd1\":%.3f,\"thvd1\":%.3f,"
