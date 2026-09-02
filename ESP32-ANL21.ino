@@ -11,7 +11,7 @@
 // Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
 // karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
 // calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
-#define FW_VERSION "1.0.3"
+#define FW_VERSION "1.0.4"
 
 #define RE_DE_PIN 4
 #define RXD2 16
@@ -480,7 +480,27 @@ void logPeakRead(const char *label, uint16_t addr, uint16_t count, uint8_t resul
 // birkac kez tekrar dener; boylece kok neden tam netlesmeden de veri kurtarilir.
 #define PEAK_BAD_SIGNATURE 0xA000
 
-bool readHoldingRegistersRetry(const char *label, uint16_t addr, uint16_t count, int maxAttempts = 3) {
+// SADECE tepe deger (readPeakBlock) ve demand (readDemandBlock) okumalarinda
+// kullaniliyor -- ikisi de loopCount%30'da, yani ~60 saniyede bir calisiyor ve
+// kendi basarisiz denemesini bir sonraki 60 saniyelik dongude kendiliginden
+// tekrarliyor. Canli olcum (readPowerAnalyzer) bu fonksiyonu KULLANMIYOR;
+// tekil denemeyle okunuyor ve zaten her 2 saniyede bir kendini tazeliyor.
+//
+// maxAttempts varsayilan olarak 3'ten 2'ye dusuruldu. Neden: canli olcum bu
+// bloktan ONCE okunup yayinlaniyor, ama BIR SONRAKI canli okuma bu blogun
+// tamamen bitmesini bekliyor. Analizor gercekten cevap vermedigi bir anda
+// peaks (3 alt-okuma) + demand (2 alt-okuma), her biri 2 yon icin, eski
+// maxAttempts=3 ile teorik en kotu durumda ~63 saniye surebiliyordu -- panel
+// verisinde gozlemlenen 9-26 saniyelik bosluklarin sebebi tam buydu.
+//
+// 2 deneme, gecici RS-485 gurultusune (kontaktor anahtarlamasi gibi) karsi
+// hala bir tekrar hakki birakiyor, ama teorik en kotu durumu ~63 sn'den
+// ~42 sn'ye indiriyor. Daha da asagi cekmek (maxAttempts=1) yerine burada
+// durulmasinin sebebi: kayip bir tepe/demand tazelemesi bir sonraki 60
+// saniyelik dongude kendiliginden telafi ediliyor, yani deneme sayisini
+// tamamen kaldirmanin getirisi kucuk, gecici gurultuye karsi direnci
+// tamamen kaybetmenin bedeli ise gereksiz.
+bool readHoldingRegistersRetry(const char *label, uint16_t addr, uint16_t count, int maxAttempts = 2) {
   for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     node.clearResponseBuffer();
     uint8_t result = node.readHoldingRegisters(addr, count);
