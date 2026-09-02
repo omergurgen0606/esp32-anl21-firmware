@@ -11,7 +11,7 @@
 // Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
 // karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
 // calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.0.3"
 
 #define RE_DE_PIN 4
 #define RXD2 16
@@ -123,6 +123,15 @@ bool tlsDogrulamaKapali = false;
 unsigned long tlsTekrarDenemeMs = 0;
 #define TLS_DOGRULAMA_TEKRAR_MS (10UL * 60UL * 1000UL)
 PubSubClient mqttClient(espClient);
+
+// Dongu periyodu hedefi. Eskiden dongunun SONUNDA sabit delay(2000) vardi;
+// blok okumalarinin suresi bu beklemenin USTUNE biniyor ve olcum araligi
+// 2 saniye yerine ortalama 5,7 saniyeye cikiyordu. Artik dongu BASINDAN
+// itibaren 2 saniye hedefleniyor.
+static const uint32_t LOOP_PERIYODU_MS = 2000;
+// Blok okumalari uzun surdugunde bile RS-485 hattina birakilan en kisa soluk.
+static const uint32_t ASGARI_BEKLEME_MS = 200;
+
 
 struct PowerData {
   float v1, i1, p1, q1, s1, f1;
@@ -243,6 +252,27 @@ void setupDeviceId() {
 }
 
 void preTransmission()  { digitalWrite(RE_DE_PIN, HIGH); }
+
+// RS-485 hattinin toparlanmasini beklerken MQTT'yi de besler.
+//
+// NEDEN: mqttClient.loop() eskiden dongude YALNIZCA BIR KEZ, en basta
+// cagriliyordu. Ondan sonra sirayla okunan bloklar -- tepe, demand,
+// harmonikler -- her biri 3 denemeye kadar, deneme basina 2 saniyelik
+// ModbusMaster zaman asimiyla, tek bir dongude 25 saniyeyi bulabiliyordu.
+// O sure boyunca PINGREQ gonderilmedigi icin broker baglantiyi keepalive
+// asimindan dusuruyordu ("disconnected: exceeded timeout"), cihaz yeniden
+// baglanana kadar yayinlanan her sey kayboluyordu (MQTT'de kuyruk yok).
+//
+// Bu fonksiyon Modbus islemlerinin ARASINDA cagriliyor, ortasinda degil --
+// yani hat bostayken. Gelen bir komut da o an isleniyor, ki bu eskisinden
+// daha guvenli bir an (bkz. onMqttMessage'daki cakisma notu).
+static void hatBekle(uint32_t ms) {
+  uint32_t bas = millis();
+  do {
+    mqttClient.loop();
+    delay(5);
+  } while (millis() - bas < ms);
+}
 void postTransmission() { digitalWrite(RE_DE_PIN, LOW); }
 
 // Excel haritasindaki "Signed 32" degerler, buffer'da 2 ardisik 16-bit register olarak
@@ -459,7 +489,9 @@ bool readHoldingRegistersRetry(const char *label, uint16_t addr, uint16_t count,
     if (result == node.ku8MBSuccess && buf0 != PEAK_BAD_SIGNATURE) {
       return true;
     }
-    delay(150);
+    // Denemeler arasi bekleme MQTT'yi besleyerek geciyor: 3 deneme x 2 sn
+    // zaman asimi, tek basina keepalive penceresini asmaya yetiyordu.
+    hatBekle(150);
   }
   return false;
 }
@@ -1084,6 +1116,13 @@ void setup() {
   espClient.setCACert(ISRG_ROOTS);
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(onMqttMessage);
+  // PubSubClient varsayilani 15 saniye; broker toleransi bunun 1,5 kati, yani
+  // 22,5 saniye. Blok okumalari bu pencereyi asabiliyordu. Asil duzeltme
+  // hatBekle() ile MQTT'yi beslemek, ama pencereyi genisletmek de gecici bir
+  // takilmanin oturumu dusurmesini engelliyor -- iki koruma birbirini
+  // tamamliyor. 60 saniye, cihazin 2 saniyelik yayin temposuna gore hala cok
+  // kisa: gercek bir kopmayi fark etmeyi geciktirmiyor.
+  mqttClient.setKeepAlive(60);
   // Harmonik/tepe-deger payload'lari buyuk (50+ alan) -- ANL13'ten daha genis
   // bir tampon gerekiyor, yoksa publish() sessizce basarisiz olur.
   mqttClient.setBufferSize(2048);
@@ -1096,6 +1135,8 @@ void setup() {
 }
 
 void loop() {
+  uint32_t donguBasi = millis();
+
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiDisconnectedSince == 0) {
       wifiDisconnectedSince = millis();
@@ -1230,9 +1271,9 @@ void loop() {
 
   // Enerji sayaclari yavas degistigi icin her dongude degil, ~30 saniyede bir okunur (2sn x 15)
   if (loopCount % 15 == 0) {
-    delay(30); // RS-485 hattina ardisik istekler arasi toparlanma suresi
+    hatBekle(30); // RS-485 hattina ardisik istekler arasi toparlanma suresi
     bool energyOk = readEnergyBlock();
-    delay(30);
+    hatBekle(30);
     readCtRatio(); // basarisiz olursa ctRatio son bilinen degerinde kalir
 
     if (energyOk) {
@@ -1250,7 +1291,7 @@ void loop() {
       Serial.println("Enerji okuma hatasi!");
     }
 
-    delay(30);
+    hatBekle(30);
     if (readTotals()) {
       char statsPayload[700];
       snprintf(statsPayload, sizeof(statsPayload),
@@ -1276,7 +1317,7 @@ void loop() {
   // (Not: Kademeler/kompanzasyon rolesi blogu kaldirildi -- bu ANL21 birimi
   // kompanzasyon rolesi degil, o registerlar bu cihazda hic mevcut degil.)
   if (loopCount % 30 == 0) {
-    delay(100);
+    hatBekle(100);
     if (readPeakBlock(peaksTuketim, 11010)) {
       char buf[1400];
       buildPeakJson(buf, sizeof(buf), peaksTuketim);
@@ -1285,7 +1326,7 @@ void loop() {
       Serial.println("Tepe degeri (tuketim) okuma hatasi!");
     }
 
-    delay(100);
+    hatBekle(100);
     if (readPeakBlock(peaksUretim, 11260)) {
       char buf[1400];
       buildPeakJson(buf, sizeof(buf), peaksUretim);
@@ -1294,7 +1335,7 @@ void loop() {
       Serial.println("Tepe degeri (uretim) okuma hatasi!");
     }
 
-    delay(100);
+    hatBekle(100);
     if (readDemandBlock(demandTuketim, 12010)) {
       char buf[1000];
       buildDemandJson(buf, sizeof(buf), demandTuketim);
@@ -1303,7 +1344,7 @@ void loop() {
       Serial.println("Demand (tuketim) okuma hatasi!");
     }
 
-    delay(100);
+    hatBekle(100);
     if (readDemandBlock(demandUretim, 12260)) {
       char buf[1000];
       buildDemandJson(buf, sizeof(buf), demandUretim);
@@ -1316,7 +1357,7 @@ void loop() {
   // Harmonikler en agir blok, gercek zamanli olmasina gerek yok -- ~5 dakikada
   // bir okunur (2sn x 150).
   if (loopCount % 150 == 0) {
-    delay(30);
+    hatBekle(30);
     if (readHarmonicsBlock(harmCurrent, 30000)) {
       char buf[1400];
       buildHarmonicsJson(buf, sizeof(buf), harmCurrent);
@@ -1325,7 +1366,7 @@ void loop() {
       Serial.println("Akim harmonikleri okuma hatasi!");
     }
 
-    delay(30);
+    hatBekle(30);
     if (readHarmonicsBlock(harmVoltage, 20000)) {
       char buf[1400];
       buildHarmonicsJson(buf, sizeof(buf), harmVoltage);
@@ -1336,5 +1377,10 @@ void loop() {
   }
 
   loopCount++;
-  delay(2000);
+
+  // Sabit beklemek yerine dongu BASINDAN itibaren LOOP_PERIYODU_MS hedefleniyor.
+  // Blok okumasi olan dongulerde eski kod 2 saniyeyi isin USTUNE ekliyordu.
+  uint32_t gecen = millis() - donguBasi;
+  uint32_t kalan = gecen < LOOP_PERIYODU_MS ? LOOP_PERIYODU_MS - gecen : 0;
+  hatBekle(kalan > ASGARI_BEKLEME_MS ? kalan : ASGARI_BEKLEME_MS);
 }
