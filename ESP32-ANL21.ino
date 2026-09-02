@@ -11,7 +11,7 @@
 // Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
 // karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
 // calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
-#define FW_VERSION "1.0.4"
+#define FW_VERSION "1.0.5"
 
 #define RE_DE_PIN 4
 #define RXD2 16
@@ -1126,6 +1126,23 @@ void setup() {
 
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);   // AP_STA'dan tamamen cik
+
+  // Modem uyku modu VARSAYILAN OLARAK ACIK gelir ve hicbir yerde kapatilmamisti.
+  // ESP32 WiFi radyosu DTIM araliklari arasinda kapaniyor, RF gurultusu altinda
+  // (bu panodaki kontaktor/motor anahtarlamalari gibi) TCP soketi ESP32'NIN
+  // KENDISI FARK ETMEDEN olebiliyor -- WiFi.status() hala WL_CONNECTED derken
+  // mqttClient.connected() false donuyor, broker de bunu "session taken over"
+  // olarak goruyor (eski oturumun TCP'si sessizce olmus, yenisi geliyor).
+  //
+  // Broker kayitlarinda bu oruntu net: cihaz gercek panoya baglanmadan once
+  // (29-30 Agustos) hic yok; 31 Agustos'tan itibaren, ozellikle 06:00-09:00 UTC
+  // (09:00-12:00 TR, mesai basi) yogunlasarak ortaya cikiyor -- ekipman
+  // kalkisinin RF gurultusuyle ortusuyor. WIFI_PS_NONE bu tur kisa/sessiz
+  // kopmalara karsi standart, dusuk riskli onlem: cihaz sebekeden besleniyor,
+  // guc tasarrufunun maliyeti burada anlamsiz, kazanci ise MQTT baglantisinin
+  // sessizce olmemesi.
+  WiFi.setSleep(false);
+
   Serial.print("WiFi'ya baglanildi: ");
   Serial.println(WiFi.SSID());
 
