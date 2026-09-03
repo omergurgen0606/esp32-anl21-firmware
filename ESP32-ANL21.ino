@@ -4,14 +4,16 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
-#include <HTTPUpdate.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <mbedtls/sha256.h>
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
 
 // Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
 // karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
 // calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
-#define FW_VERSION "1.0.5"
+#define FW_VERSION "1.0.6"
 
 #define RE_DE_PIN 4
 #define RXD2 16
@@ -662,6 +664,35 @@ bool extractJsonField(const char* body, const char* key, char* out, size_t outSi
   return true;
 }
 
+// MQTT'nin tek paylasilan kimlik bilgisini ele geciren biri eskiden "url"
+// alanina istedigi adresi yazip cihaza ISTEDIGI KODU calistirabilirdi --
+// ISRG_ROOTS herkese acik bir kok sertifika, saldirganin kendi alan adi icin
+// gecerli bir sertifikasi olmasi TLS dogrulamasini gecmeye yeterdi, bu
+// binaryenerji.com'a ozel bir korumaya denk gelmiyordu. Mesajdaki sha256
+// alani da vardi ama cihaz hic okumuyordu, yalnizca elle karsilastirma icin
+// duruyordu.
+//
+// Artik iki kontrol var: adres SADECE binaryenerji.com'a gidebiliyor, ve
+// indirilen baytlarin sha256'si mesajdakiyle BIREBIR uyusmadan yazma asla
+// tamamlanmiyor (Update.end yerine Update.abort cagriliyor).
+//
+// Neden imza degil bu ikisi: saldirganin MQTT kimlik bilgisiyle tek basina
+// yapabilecegi artik hicbir sey yok -- baglanti disariya cikamiyor, sunucudaki
+// mevcut bir .bin'i baska bir surum gibi gostermeye calissa bile sha256
+// tutmaz. Bunun otesi (sunucuya SAHTE bir .bin yukleyip gercek adresten
+// sunmak) zaten ayri bir yetki (require_admin) gerektiriyor -- imza o
+// senaryoya karsi korurdu, ama bu firmware'in tek basina kapatabilecegi bir
+// acik degil.
+static const char* OTA_IZINLI_ADRES_ONEKI = "https://binaryenerji.com/";
+
+bool otaSha256Dogrula(const char* beklenenHex, const uint8_t* ozet) {
+  if (strlen(beklenenHex) != 64) return false;
+  char hesaplanan[65];
+  for (int i = 0; i < 32; i++) sprintf(hesaplanan + i * 2, "%02x", ozet[i]);
+  hesaplanan[64] = '\0';
+  return strcasecmp(hesaplanan, beklenenHex) == 0;
+}
+
 void handleOtaMessage(byte* payload, unsigned int length) {
   char buf[400];
   unsigned int n = length < sizeof(buf) - 1 ? length : sizeof(buf) - 1;
@@ -670,11 +701,21 @@ void handleOtaMessage(byte* payload, unsigned int length) {
 
   char url[300];
   char version[32];
+  char beklenenSha256[65];
   if (!extractJsonField(buf, "url", url, sizeof(url))) {
     Serial.println("OTA: gecersiz mesaj, url alani yok");
     return;
   }
   extractJsonField(buf, "version", version, sizeof(version));
+  if (!extractJsonField(buf, "sha256", beklenenSha256, sizeof(beklenenSha256))) {
+    Serial.println("OTA: reddedildi -- sha256 alani yok, dogrulanamayan firmware kabul edilmiyor.");
+    return;
+  }
+  if (strncmp(url, OTA_IZINLI_ADRES_ONEKI, strlen(OTA_IZINLI_ADRES_ONEKI)) != 0) {
+    Serial.print("OTA: reddedildi -- izin verilmeyen adres: ");
+    Serial.println(url);
+    return;
+  }
 
   Serial.print("OTA baslatiliyor, surum: ");
   Serial.print(version);
@@ -686,34 +727,116 @@ void handleOtaMessage(byte* payload, unsigned int length) {
   otaPrefs.putBool("pending", true);
 
   WiFiClientSecure client;
-  // OTA dogrulanmis TLS kullanir. setInsecure() ile araya giren biri cihaza
-  // istedigi firmware'i yukleyebilirdi -- telemetriyi okumaktan daha agir bir
-  // acikti. Ayni emniyet yedegi burada da gecerli.
   if (tlsDogrulamaKapali) {
     client.setInsecure();
   } else {
     client.setCACert(ISRG_ROOTS);
   }
-  httpUpdate.rebootOnUpdate(false);
-  t_httpUpdate_return ret = httpUpdate.update(client, url);
 
-  switch (ret) {
-    case HTTP_UPDATE_FAILED:
-      Serial.printf("OTA basarisiz (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-      otaPrefs.putBool("pending", false); // yazma hic basarili olmadi, eski firmware zaten aktif
-      mqttClient.publish(statusTopic.c_str(), "ota_failed", false);
-      break;
-    case HTTP_UPDATE_NO_UPDATES:
-      Serial.println("OTA: guncelleme yok");
-      otaPrefs.putBool("pending", false);
-      break;
-    case HTTP_UPDATE_OK:
-      Serial.println("OTA basarili, yeniden baslatiliyor...");
-      mqttClient.publish(statusTopic.c_str(), "ota_rebooting", false);
-      delay(200);
-      ESP.restart();
-      break;
+  HTTPClient http;
+  bool otaBasarisiz = false;
+  const char* basarisizlikNedeni = "";
+
+  if (!http.begin(client, url)) {
+    otaBasarisiz = true;
+    basarisizlikNedeni = "baglanti kurulamadi";
   }
+
+  int httpKod = otaBasarisiz ? 0 : http.GET();
+  if (!otaBasarisiz && httpKod != HTTP_CODE_OK) {
+    otaBasarisiz = true;
+    basarisizlikNedeni = "beklenmeyen HTTP yaniti";
+  }
+
+  int boyut = otaBasarisiz ? 0 : http.getSize();
+  if (!otaBasarisiz && !Update.begin(boyut > 0 ? (size_t)boyut : UPDATE_SIZE_UNKNOWN)) {
+    otaBasarisiz = true;
+    basarisizlikNedeni = Update.errorString();
+  }
+
+  size_t yazilan = 0;
+  uint8_t ozet[32];
+
+  if (!otaBasarisiz) {
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0); // 0 = SHA-256 (SHA-224 degil)
+
+    NetworkClient* akis = http.getStreamPtr();
+    uint8_t tampon[512];
+    unsigned long sonVeriMs = millis();
+
+    while (true) {
+      if (boyut > 0 && yazilan >= (size_t)boyut) break; // beklenen boyuta ulasildi
+      if (!http.connected() && akis->available() == 0) break; // baglanti bitti, veri kalmadi
+
+      size_t mevcut = akis->available();
+      if (mevcut == 0) {
+        if (millis() - sonVeriMs > 15000) {
+          otaBasarisiz = true;
+          basarisizlikNedeni = "veri akisi durdu (zaman asimi)";
+          break;
+        }
+        delay(10);
+        continue;
+      }
+      size_t okunacak = mevcut > sizeof(tampon) ? sizeof(tampon) : mevcut;
+      // Sunucu beklenenden fazla bayt gonderirse (Content-Length'e guvenmek
+      // yerine) tamponun disina, ozetin disina tasmasin -- boyut biliniyorsa
+      // kalan miktari asmayacak sekilde kirp.
+      if (boyut > 0) {
+        size_t kalan = (size_t)boyut - yazilan;
+        if (okunacak > kalan) okunacak = kalan;
+      }
+      size_t okunan = akis->readBytes(tampon, okunacak);
+      if (okunan == 0) continue;
+      sonVeriMs = millis();
+
+      if (Update.write(tampon, okunan) != okunan) {
+        otaBasarisiz = true;
+        basarisizlikNedeni = "flash yazma hatasi";
+        break;
+      }
+      mbedtls_sha256_update(&sha, tampon, okunan);
+      yazilan += okunan;
+    }
+
+    mbedtls_sha256_finish(&sha, ozet);
+    mbedtls_sha256_free(&sha);
+
+    if (!otaBasarisiz && boyut > 0 && yazilan != (size_t)boyut) {
+      otaBasarisiz = true;
+      basarisizlikNedeni = "indirme yarim kaldi";
+    }
+    if (!otaBasarisiz && !otaSha256Dogrula(beklenenSha256, ozet)) {
+      otaBasarisiz = true;
+      basarisizlikNedeni = "sha256 uyusmuyor -- indirilen dosya beklenenden farkli";
+    }
+  }
+
+  http.end();
+
+  if (otaBasarisiz) {
+    Serial.print("OTA basarisiz: ");
+    Serial.println(basarisizlikNedeni);
+    Update.abort(); // yaziliyorsa bile tamamlanmadi, eski firmware aktif kaliyor
+    otaPrefs.putBool("pending", false);
+    mqttClient.publish(statusTopic.c_str(), "ota_failed", false);
+    return;
+  }
+
+  if (!Update.end(true)) {
+    Serial.print("OTA basarisiz: ");
+    Serial.println(Update.errorString());
+    otaPrefs.putBool("pending", false);
+    mqttClient.publish(statusTopic.c_str(), "ota_failed", false);
+    return;
+  }
+
+  Serial.println("OTA basarili (adres ve sha256 dogrulandi), yeniden baslatiliyor...");
+  mqttClient.publish(statusTopic.c_str(), "ota_rebooting", false);
+  delay(200);
+  ESP.restart();
 }
 
 // Yeni yazilan firmware WiFi+MQTT'ye baglanip en az bir kez canli veri
