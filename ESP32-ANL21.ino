@@ -14,7 +14,7 @@
 // Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
 // karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
 // calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
-#define FW_VERSION "1.0.7"
+#define FW_VERSION "1.0.8"
 
 #define RE_DE_PIN 4
 #define RXD2 16
