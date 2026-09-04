@@ -7,13 +7,14 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <mbedtls/sha256.h>
+#include <esp_random.h>
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
 
 // Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
 // karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
 // calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
-#define FW_VERSION "1.0.6"
+#define FW_VERSION "1.0.7"
 
 #define RE_DE_PIN 4
 #define RXD2 16
@@ -227,6 +228,12 @@ unsigned long otaPendingSince = 0;
 // WiFi kurulumu: telefon uygulamasi (Tuya benzeri) cihazin actigi AP'ye baglanip
 // buradan ev WiFi bilgisini gonderir -- tarayici/portal sayfasi yok, tamamen JSON.
 Preferences prefs;
+// Cihaz-basina MQTT kimligi. WiFi'den AYRI bir namespace: WiFi bilgisi
+// degisebilir/sifirlanabilir, ama bir kez kaydolan MQTT kimligi kalici olmali
+// -- ikisini karistirmak, WiFi sifirlamasinin MQTT kaydini da silip cihazi
+// sunucuda yanlislikla "yeniden kaydolmasi gereken" duruma dusurmesine yol
+// acardi.
+Preferences mqttAuthPrefs;
 WebServer provisionServer(80);
 volatile bool wifiConfigured = false;
 String pendingSsid, pendingPass;
@@ -1065,8 +1072,69 @@ String extractJsonString(const String &body, const String &key) {
   return body.substring(idx + 1, end);
 }
 
+// Cihazin KENDI URETTIGI, hicbir firmware imajinda ortak olmayan MQTT sifresi.
+//
+// NEDEN: tum cihazlara AYNI .bin yukleniyor. Imaja gomulen herhangi bir sabit
+// deger (sifre ya da onu turetecek bir sir) butun birimlerde ayni olurdu --
+// birini flash'tan cikarmak hepsini ele verirdi. Bugune kadar tam bu durumdaydi
+// (tek paylasilan "esp32user" kimlik bilgisi). Donanim RNG'siyle CIHAZDA
+// uretilen bir deger hicbir baska cihazda tekrarlanmiyor.
+//
+// Bu deger yalnizca kurulum AP'si (yerel, internete cikmayan) uzerinden
+// telefon uygulamasina iletiliyor, oradan da kullanicinin zaten oturum acmis
+// oldugu HTTPS baglantisiyla sunucuya ulasiyor -- paylasilan MQTT kimlik
+// bilgisini elinde tutan biri bu degeri YOLDAYKEN goremez, cunku o kimlik
+// bilgisi bu alisverisin hicbir asamasinda kullanilmiyor.
+String uretilenMqttSifresi(size_t bayt = 24) {
+  String sonuc;
+  sonuc.reserve(bayt * 2);
+  char h[3];
+  for (size_t i = 0; i < bayt; i++) {
+    sprintf(h, "%02x", (uint8_t)(esp_random() & 0xFF));
+    sonuc += h;
+  }
+  return sonuc;
+}
+
+// Cihaz daha once hic kayit olmadiysa bir MQTT sifresi uretip KALICI olarak
+// saklar. Yalnizca kurulum AP'si acikken cagriliyor, WiFi baglantisindan
+// bagimsiz -- boylece WiFi defalarca degisse/sifirlansa bile MQTT kimligi
+// tek seferlik uretilip sonsuza dek ayni kaliyor.
+String kurulumMqttSifresi() {
+  String sifre = mqttAuthPrefs.getString("pass", "");
+  if (sifre.length() == 0) {
+    sifre = uretilenMqttSifresi();
+    mqttAuthPrefs.putString("pass", sifre);
+    Serial.println("Yeni MQTT kimligi uretildi (yerel AP uzerinden telefona iletilecek).");
+  }
+  return sifre;
+}
+
 void handleProvisionStatus() {
-  provisionServer.send(200, "application/json", "{\"device_id\":\"" + deviceId + "\"}");
+  String yanit = "{\"device_id\":\"" + deviceId + "\"";
+  // "confirmed" olmadigi surece (sunucu kaydi HENUZ tamamlanmadi) sifre her
+  // /status yanitina ekleniyor -- uygulama cihazi bulur bulmaz yakalayabilsin.
+  // confirmed olduktan sonra bir daha eklenmiyor: aksi halde her yoklamada
+  // ayni sirri yerel agda tekrar tekrar dolastirmis oluruz, gereksiz.
+  if (!mqttAuthPrefs.getBool("confirmed", false)) {
+    yanit += ",\"mqtt_username\":\"" + deviceId + "\"";
+    yanit += ",\"mqtt_password\":\"" + kurulumMqttSifresi() + "\"";
+  }
+  yanit += "}";
+  provisionServer.send(200, "application/json", yanit);
+}
+
+// Uygulama, uretilen kimligi sunucuya BASARIYLA kaydettikten sonra bu uc
+// noktayi cagirir. Bundan sonra cihaz bir sonraki MQTT baglantisinda paylasilan
+// kimlik yerine kendi kimligini kullanmaya baslar (bkz. loop()).
+//
+// Onay olmadan asla gecis YAPILMIYOR: sunucu tarafinda kayit basarisiz olduysa
+// (ag hatasi, uygulama kapanmasi vb.) cihaz sessizce sunucunun tanimadigi bir
+// kimlikle baglanmayi denemez -- paylasilan kimlikte kalmaya devam eder.
+void handleProvisionMqttConfirm() {
+  mqttAuthPrefs.putBool("confirmed", true);
+  Serial.println("MQTT kaydi sunucuda onaylandi -- bundan sonra kendi kimligimle baglanacagim.");
+  provisionServer.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 void handleProvisionConfigure() {
@@ -1146,6 +1214,7 @@ bool startProvisioningAP(const String &savedSsid, const String &savedPass) {
   if (!handlerlarKuruldu) {
     provisionServer.on("/status", HTTP_GET, handleProvisionStatus);
     provisionServer.on("/configure", HTTP_POST, handleProvisionConfigure);
+    provisionServer.on("/mqtt-confirm", HTTP_POST, handleProvisionMqttConfirm);
     handlerlarKuruldu = true;
   }
   provisionServer.begin();
@@ -1213,6 +1282,7 @@ void setup() {
 
   pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
   prefs.begin("wifi", false);
+  mqttAuthPrefs.begin("mqttauth", false);
 
   if (digitalRead(WIFI_RESET_PIN) == LOW) {
     Serial.println("BOOT tusu basili -- kayitli WiFi bilgisi siliniyor, kurulum moduna giriliyor.");
@@ -1313,8 +1383,16 @@ void loop() {
   wifiDisconnectedSince = 0;
 
   if (!mqttClient.connected()) {
+    // "confirmed" olmadan ASLA kendi kimligime gecmiyorum -- sunucu tarafinda
+    // kayit basarisiz kaldiysa (uygulama /mqtt-confirm'i hic cagirmadiysa)
+    // tanimadigi bir kullaniciyla baglanmaya calisip kendimi sonsuza dek
+    // baglanamaz durumda birakmamak icin. Onaylanana kadar eski paylasilan
+    // kimlik calismaya devam ediyor.
+    bool kendiKimligim = mqttAuthPrefs.getBool("confirmed", false);
+    String kUser = kendiKimligim ? deviceId : String("esp32user");
+    String kPass = kendiKimligim ? mqttAuthPrefs.getString("pass", "") : String("***REDACTED-MQTT-PASSWORD***");
     bool ok = mqttClient.connect(
-      deviceId.c_str(), "esp32user", "***REDACTED-MQTT-PASSWORD***",
+      deviceId.c_str(), kUser.c_str(), kPass.c_str(),
       statusTopic.c_str(), 1, true, "offline");
     if (ok) {
       mqttClient.subscribe(cmdTopic.c_str());
