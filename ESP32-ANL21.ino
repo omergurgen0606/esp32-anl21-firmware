@@ -1112,29 +1112,10 @@ String kurulumMqttSifresi() {
 
 void handleProvisionStatus() {
   String yanit = "{\"device_id\":\"" + deviceId + "\"";
-  // "confirmed" olmadigi surece (sunucu kaydi HENUZ tamamlanmadi) sifre her
-  // /status yanitina ekleniyor -- uygulama cihazi bulur bulmaz yakalayabilsin.
-  // confirmed olduktan sonra bir daha eklenmiyor: aksi halde her yoklamada
-  // ayni sirri yerel agda tekrar tekrar dolastirmis oluruz, gereksiz.
-  if (!mqttAuthPrefs.getBool("confirmed", false)) {
-    yanit += ",\"mqtt_username\":\"" + deviceId + "\"";
-    yanit += ",\"mqtt_password\":\"" + kurulumMqttSifresi() + "\"";
-  }
+  yanit += ",\"mqtt_username\":\"" + deviceId + "\"";
+  yanit += ",\"mqtt_password\":\"" + kurulumMqttSifresi() + "\"";
   yanit += "}";
   provisionServer.send(200, "application/json", yanit);
-}
-
-// Uygulama, uretilen kimligi sunucuya BASARIYLA kaydettikten sonra bu uc
-// noktayi cagirir. Bundan sonra cihaz bir sonraki MQTT baglantisinda paylasilan
-// kimlik yerine kendi kimligini kullanmaya baslar (bkz. loop()).
-//
-// Onay olmadan asla gecis YAPILMIYOR: sunucu tarafinda kayit basarisiz olduysa
-// (ag hatasi, uygulama kapanmasi vb.) cihaz sessizce sunucunun tanimadigi bir
-// kimlikle baglanmayi denemez -- paylasilan kimlikte kalmaya devam eder.
-void handleProvisionMqttConfirm() {
-  mqttAuthPrefs.putBool("confirmed", true);
-  Serial.println("MQTT kaydi sunucuda onaylandi -- bundan sonra kendi kimligimle baglanacagim.");
-  provisionServer.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 void handleProvisionConfigure() {
@@ -1214,7 +1195,6 @@ bool startProvisioningAP(const String &savedSsid, const String &savedPass) {
   if (!handlerlarKuruldu) {
     provisionServer.on("/status", HTTP_GET, handleProvisionStatus);
     provisionServer.on("/configure", HTTP_POST, handleProvisionConfigure);
-    provisionServer.on("/mqtt-confirm", HTTP_POST, handleProvisionMqttConfirm);
     handlerlarKuruldu = true;
   }
   provisionServer.begin();
@@ -1383,17 +1363,28 @@ void loop() {
   wifiDisconnectedSince = 0;
 
   if (!mqttClient.connected()) {
-    // "confirmed" olmadan ASLA kendi kimligime gecmiyorum -- sunucu tarafinda
-    // kayit basarisiz kaldiysa (uygulama /mqtt-confirm'i hic cagirmadiysa)
-    // tanimadigi bir kullaniciyla baglanmaya calisip kendimi sonsuza dek
-    // baglanamaz durumda birakmamak icin. Onaylanana kadar eski paylasilan
-    // kimlik calismaya devam ediyor.
-    bool kendiKimligim = mqttAuthPrefs.getBool("confirmed", false);
-    String kUser = kendiKimligim ? deviceId : String("esp32user");
-    String kPass = kendiKimligim ? mqttAuthPrefs.getString("pass", "") : String("***REDACTED-MQTT-PASSWORD***");
-    bool ok = mqttClient.connect(
-      deviceId.c_str(), kUser.c_str(), kPass.c_str(),
-      statusTopic.c_str(), 1, true, "offline");
+    // Kendi kimligim varsa ONCE onu deniyorum. Sunucu tarafinda kayit henuz
+    // uygulanmamis olabilir (host betigi 3 dakikada bir calisiyor) -- o
+    // durumda broker reddeder, ben de AYNI dongude paylasilan kimlikle
+    // deniyorum. Ayri bir "onay" adimina gerek yok: kurulum sirasinda
+    // kullanilan yerel AP, uygulama /configure'a yanit verir vermez terk
+    // edildigi icin (bkz. WiFiProvisioningView), cihaza sonradan geri
+    // "onaylandi" haberi verecek bir kanal zaten kalmiyor. Kendi kimligim bir
+    // kez ise yaramaya basladiginda kalici olarak ona geciyorum; kayit hic
+    // tamamlanmazsa paylasilan kimlikle calismaya sonsuza dek devam ediyorum.
+    String kendiSifre = mqttAuthPrefs.getString("pass", "");
+    bool kendiKimlikVar = kendiSifre.length() > 0;
+    bool ok = false;
+    if (kendiKimlikVar) {
+      ok = mqttClient.connect(
+        deviceId.c_str(), deviceId.c_str(), kendiSifre.c_str(),
+        statusTopic.c_str(), 1, true, "offline");
+    }
+    if (!ok) {
+      ok = mqttClient.connect(
+        deviceId.c_str(), "esp32user", "***REDACTED-MQTT-PASSWORD***",
+        statusTopic.c_str(), 1, true, "offline");
+    }
     if (ok) {
       mqttClient.subscribe(cmdTopic.c_str());
       mqttClient.subscribe(otaTopic.c_str());
