@@ -10,11 +10,12 @@
 #include <esp_random.h>
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
+#include "secrets.h"
 
 // Bu gateway firmware'inin kendi surumu (Modbus cihazinin sistem_versiyon'uyla
 // karistirilmamali -- o sayacin/analizorun kendi ic surumu, bu ise ESP32'nin
 // calistirdiği .ino kodunun surumu). OTA guncellemeleri bu degeri artirarak yapilir.
-#define FW_VERSION "1.0.8"
+#define FW_VERSION "1.0.9"
 
 #define RE_DE_PIN 4
 #define RXD2 16
@@ -1382,7 +1383,7 @@ void loop() {
     }
     if (!ok) {
       ok = mqttClient.connect(
-        deviceId.c_str(), "esp32user", "***REDACTED-MQTT-PASSWORD***",
+        deviceId.c_str(), MQTT_SHARED_USER, MQTT_SHARED_PASSWORD,
         statusTopic.c_str(), 1, true, "offline");
     }
     if (ok) {
